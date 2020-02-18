@@ -45,6 +45,7 @@ type NIC struct {
 	context NICContext
 
 	stats NICStats
+	neigh neighborCache
 
 	mu struct {
 		sync.RWMutex
@@ -131,6 +132,11 @@ func newNIC(stack *Stack, id tcpip.NICID, name string, ep LinkEndpoint, ctx NICC
 		onLinkPrefixes: make(map[tcpip.Subnet]onLinkPrefixState),
 		slaacPrefixes:  make(map[tcpip.Subnet]slaacPrefixState),
 	}
+	nic.neigh = neighborCache{
+		nic:   nic,
+		state: NewNUDState(stack.nudConfigs),
+	}
+	nic.neigh.mu.cache = make(map[tcpip.Address]*neighborEntry, neighborCacheSize)
 
 	// Register supported packet endpoint protocols.
 	for _, netProto := range header.Ethertypes {
@@ -744,7 +750,7 @@ func (n *NIC) addAddressLocked(protocolAddress tcpip.ProtocolAddress, peb Primar
 	}
 
 	// Create the new network endpoint.
-	ep, err := netProto.NewEndpoint(n.id, protocolAddress.AddressWithPrefix, n.stack, n, n.linkEP, n.stack)
+	ep, err := netProto.NewEndpoint(n.id, protocolAddress.AddressWithPrefix, &n.neigh, n, n.linkEP, n.stack)
 	if err != nil {
 		return nil, err
 	}
@@ -769,10 +775,11 @@ func (n *NIC) addAddressLocked(protocolAddress tcpip.ProtocolAddress, peb Primar
 		deprecated: deprecated,
 	}
 
-	// Set up cache if link address resolution exists for this protocol.
+	// Set up cache and resolver if link address resolution exists for this protocol.
 	if n.linkEP.Capabilities()&CapabilityResolutionRequired != 0 {
-		if _, ok := n.stack.linkAddrResolvers[protocolAddress.Protocol]; ok {
-			ref.linkCache = n.stack
+		if linkRes, ok := n.stack.linkAddrResolvers[protocolAddress.Protocol]; ok {
+			ref.linkRes = linkRes
+			ref.neigh = &n.neigh
 		}
 	}
 
@@ -1058,6 +1065,22 @@ func (n *NIC) RemoveAddress(addr tcpip.Address) *tcpip.Error {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	return n.removePermanentAddressLocked(addr)
+}
+
+func (n *NIC) neighbors() []NeighborEntry {
+	return n.neigh.entries()
+}
+
+func (n *NIC) addStaticNeighbor(addr tcpip.Address, linkAddress tcpip.LinkAddress) {
+	n.neigh.addStaticEntry(addr, linkAddress)
+}
+
+func (n *NIC) removeNeighbor(addr tcpip.Address) bool {
+	return n.neigh.removeEntry(addr)
+}
+
+func (n *NIC) clearNeighbors() {
+	n.neigh.clear()
 }
 
 // joinGroup adds a new endpoint for the given multicast address, if none
@@ -1457,6 +1480,19 @@ func (n *NIC) setNDPConfigs(c NDPConfigurations) {
 	n.mu.Unlock()
 }
 
+// NUDConfigs gets the NUD configurations for n.
+func (n *NIC) NUDConfigs() NUDConfigurations {
+	return n.neigh.config()
+}
+
+// setNUDConfigs sets the NUD configurations for n.
+//
+// Note, if c contains invalid NUD configuration values, it will be fixed to
+// use default values for the erroneous values.
+func (n *NIC) setNUDConfigs(c NUDConfigurations) {
+	n.neigh.setConfig(c.resetInvalidFields())
+}
+
 // handleNDPRA handles an NDP Router Advertisement message that arrived on n.
 func (n *NIC) handleNDPRA(ip tcpip.Address, ra header.NDPRouterAdvert) {
 	n.mu.Lock()
@@ -1548,9 +1584,13 @@ type referencedNetworkEndpoint struct {
 	nic      *NIC
 	protocol tcpip.NetworkProtocolNumber
 
-	// linkCache is set if link address resolution is enabled for this
-	// protocol. Set to nil otherwise.
-	linkCache LinkAddressCache
+	// neigh is set if link address resolution is enabled for this protocol. Set
+	// to nil otherwise.
+	neigh *neighborCache
+
+	// linkRes is set if link address resolution is enabled for this protocol.
+	// Set to nil otherwise.
+	linkRes LinkAddressResolver
 
 	// refs is counting references held for this endpoint. When refs hits zero it
 	// triggers the automatic removal of the endpoint from the NIC.
