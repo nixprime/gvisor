@@ -76,13 +76,20 @@ afterSymlink:
 	}
 	// Resolve any symlink at current path component.
 	if rp.ShouldFollowSymlink() && next.isSymlink() {
-		// TODO: VFS2 needs something extra for /proc/[pid]/fd/ "magic symlinks".
-		target, err := next.inode.Readlink(ctx)
+		targetVD, targetPathname, err := next.inode.Getlink(ctx)
 		if err != nil {
 			return nil, err
 		}
-		if err := rp.HandleSymlink(target); err != nil {
-			return nil, err
+		if targetVD.Ok() {
+			err := rp.HandleJump(targetVD)
+			targetVD.DecRef()
+			if err != nil {
+				return nil, err
+			}
+		} else {
+			if err := rp.HandleSymlink(targetPathname); err != nil {
+				return nil, err
+			}
 		}
 		goto afterSymlink
 
