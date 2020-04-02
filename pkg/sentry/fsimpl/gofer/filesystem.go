@@ -160,9 +160,6 @@ afterSymlink:
 	if err != nil {
 		return nil, err
 	}
-	if child == nil {
-		return nil, syserror.ENOENT
-	}
 	if child.isSymlink() && rp.ShouldFollowSymlink() {
 		target, err := child.readlink(ctx, rp.Mount())
 		if err != nil {
@@ -179,8 +176,8 @@ afterSymlink:
 
 // revalidateChildLocked must be called after a call to parent.vfsd.Child(name)
 // or vfs.ResolvingPath.ResolveChild(name) returns childVFSD (which may be
-// nil) to verify that the returned child (or lack thereof) is correct. If no file
-// exists at name, revalidateChildLocked returns (nil, nil).
+// nil) to verify that the returned child (or lack thereof) is correct. If no
+// file exists at name, revalidateChildLocked returns (nil, ENOENT).
 //
 // Preconditions: fs.renameMu must be locked. parent.dirMu must be locked.
 // parent.isDir(). name is not "." or "..".
@@ -200,7 +197,7 @@ func (fs *filesystem) revalidateChildLocked(ctx context.Context, vfsObj *vfs.Vir
 	}
 	// Check if we've already cached this lookup with a negative result.
 	if _, ok := parent.negativeChildren[name]; ok {
-		return nil, nil
+		return nil, syserror.ENOENT
 	}
 	// Perform the remote lookup.
 	qid, file, attrMask, attr, err := parent.file.walkGetAttrOne(ctx, name)
@@ -210,8 +207,7 @@ func (fs *filesystem) revalidateChildLocked(ctx context.Context, vfsObj *vfs.Vir
 	if childVFSD != nil {
 		child := childVFSD.Impl().(*dentry)
 		if !file.isNil() && qid.Path == child.ino {
-			// The file at this path hasn't changed. Just update cached
-			// metadata.
+			// The file at this path hasn't changed. Just update cached metadata.
 			file.close(ctx)
 			child.updateFromP9Attrs(attrMask, &attr)
 			return child, nil
@@ -224,12 +220,11 @@ func (fs *filesystem) revalidateChildLocked(ctx context.Context, vfsObj *vfs.Vir
 		childVFSD = nil
 	}
 	if file.isNil() {
-		// No file exists at this path now. Cache the negative lookup if
-		// allowed.
+		// No file exists at this path now. Cache the negative lookup if allowed.
 		if fs.opts.interop != InteropModeShared {
 			parent.cacheNegativeChildLocked(name)
 		}
-		return nil, nil
+		return nil, syserror.ENOENT
 	}
 	// Create a new dentry representing the file.
 	child, err := fs.newDentry(ctx, file, qid, attrMask, &attr)
@@ -367,6 +362,7 @@ func (fs *filesystem) unlinkAt(ctx context.Context, rp *vfs.ResolvingPath, dir b
 	var ds *[]*dentry
 	fs.renameMu.RLock()
 	defer fs.renameMuRUnlockAndCheckCaching(&ds)
+
 	start := rp.Start().Impl().(*dentry)
 	if fs.opts.interop == InteropModeShared {
 		// Get updated metadata for start as required by
@@ -400,57 +396,38 @@ func (fs *filesystem) unlinkAt(ctx context.Context, rp *vfs.ResolvingPath, dir b
 			return syserror.EISDIR
 		}
 	}
+
 	vfsObj := rp.VirtualFilesystem()
 	mntns := vfs.MountNamespaceFromContext(ctx)
 	defer mntns.DecRef()
+
 	parent.dirMu.Lock()
 	defer parent.dirMu.Unlock()
-	childVFSD := parent.vfsd.Child(name)
-	var child *dentry
-	// We only need a dentry representing the file at name if it can be a mount
-	// point. If childVFSD is nil, then it can't be a mount point. If childVFSD
-	// is non-nil but stale, the actual file can't be a mount point either; we
-	// detect this case by just speculatively calling PrepareDeleteDentry and
-	// only revalidating the dentry if that fails (indicating that the existing
-	// dentry is a mount point).
-	if childVFSD != nil {
-		child = childVFSD.Impl().(*dentry)
-		if err := vfsObj.PrepareDeleteDentry(mntns, childVFSD); err != nil {
-			child, err = fs.revalidateChildLocked(ctx, vfsObj, parent, name, childVFSD, &ds)
-			if err != nil {
-				return err
-			}
-			if child != nil {
-				childVFSD = &child.vfsd
-				if err := vfsObj.PrepareDeleteDentry(mntns, childVFSD); err != nil {
-					return err
-				}
-			} else {
-				childVFSD = nil
-			}
-		}
-	} else if _, ok := parent.negativeChildren[name]; ok {
-		return syserror.ENOENT
+
+	child, err := fs.revalidateChildLocked(ctx, vfsObj, parent, name, parent.vfsd.Child(name), &ds)
+	if err != nil {
+		return err
 	}
 	flags := uint32(0)
 	if dir {
-		if child != nil && !child.isDir() {
+		if !child.isDir() {
 			return syserror.ENOTDIR
 		}
 		flags = linux.AT_REMOVEDIR
 	} else {
-		if child != nil && child.isDir() {
+		if child.isDir() {
 			return syserror.EISDIR
 		}
 		if rp.MustBeDir() {
 			return syserror.ENOTDIR
 		}
 	}
+	if err := vfsObj.PrepareDeleteDentry(mntns, &child.vfsd); err != nil {
+		return err
+	}
 	err = parent.file.unlinkAt(ctx, name, flags)
 	if err != nil {
-		if childVFSD != nil {
-			vfsObj.AbortDeleteDentry(childVFSD)
-		}
+		vfsObj.AbortDeleteDentry(&child.vfsd)
 		return err
 	}
 	if fs.opts.interop != InteropModeShared {
@@ -461,11 +438,9 @@ func (fs *filesystem) unlinkAt(ctx context.Context, rp *vfs.ResolvingPath, dir b
 		parent.cacheNegativeChildLocked(name)
 		parent.dirents = nil
 	}
-	if child != nil {
-		child.setDeleted()
-		vfsObj.CommitDeleteDentry(childVFSD)
-		ds = appendDentry(ds, child)
-	}
+	child.setDeleted()
+	vfsObj.CommitDeleteDentry(&child.vfsd)
+	ds = appendDentry(ds, child)
 	return nil
 }
 
@@ -896,9 +871,6 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 	renamed, err := fs.revalidateChildLocked(ctx, vfsObj, oldParent, oldName, oldParent.vfsd.Child(oldName), &ds)
 	if err != nil {
 		return err
-	}
-	if renamed == nil {
-		return syserror.ENOENT
 	}
 	if renamed.isDir() {
 		if renamed == newParent || renamed.vfsd.IsAncestorOf(&newParent.vfsd) {

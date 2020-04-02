@@ -953,6 +953,11 @@ func (d *dentry) checkCachingLocked() {
 	}
 }
 
+// destroyLocked is idempotent because it may be called multiple times via
+// renameMu[R]UnlockAndCheckCaching -> checkCachingLocked -> destroyLocked, when
+// the same dirent is visited more than once in the same operation and needs
+// to be destroyed. This is more efficient than detecting duplicates.
+//
 // Preconditions: d.fs.renameMu must be locked for writing. d.refs == 0. d is
 // not a child dentry.
 func (d *dentry) destroyLocked() {
@@ -975,9 +980,18 @@ func (d *dentry) destroyLocked() {
 		d.handle.close(ctx)
 	}
 	d.handleMu.Unlock()
-	d.file.close(ctx)
+	if !d.file.isNil() {
+		d.file.close(ctx)
+		d.file = p9file{}
+	}
 	// Remove d from the set of all dentries.
 	d.fs.syncMu.Lock()
+	if _, ok := d.fs.dentries[d]; !ok {
+		d.fs.syncMu.Unlock()
+		// This dentry has already been destroyed. Don't attempt to remove reference
+		// on the parent again.
+		return
+	}
 	delete(d.fs.dentries, d)
 	d.fs.syncMu.Unlock()
 	// Drop the reference held by d on its parent.
