@@ -174,6 +174,18 @@ class PosixImpl final : public posix_server::Posix::Service {
     return ::grpc::Status::OK;
   }
 
+  ::grpc::Status SetSockOptInt(
+      ::grpc::ServerContext *context,
+      const ::posix_server::SetSockOptIntRequest *request,
+      ::posix_server::SetSockOptIntResponse *response) override {
+    errno = 0;
+    int opt = request->intval();
+    response->set_ret(::setsockopt(request->sockfd(), request->level(),
+                                   request->optname(), &opt, sizeof(opt)));
+    response->set_errno_(errno);
+    return ::grpc::Status::OK;
+  }
+
   ::grpc::Status Close(grpc_impl::ServerContext *context,
                        const ::posix_server::CloseRequest *request,
                        ::posix_server::CloseResponse *response) override {
@@ -190,6 +202,16 @@ class PosixImpl final : public posix_server::Posix::Service {
         recv(request->sockfd(), buf.data(), buf.size(), request->flags()));
     response->set_errno_(errno);
     response->set_buf(buf.data(), response->ret());
+    return ::grpc::Status::OK;
+  }
+
+  ::grpc::Status Send(::grpc::ServerContext *context,
+                      const ::posix_server::SendRequest *request,
+                      ::posix_server::SendResponse *response) override {
+    errno = 0;
+    response->set_ret(::send(request->sockfd(), request->buf().data(),
+                             request->buf().size(), request->flags()));
+    response->set_errno_(errno);
     return ::grpc::Status::OK;
   }
 };

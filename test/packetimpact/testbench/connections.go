@@ -187,9 +187,19 @@ func (conn *TCPIPv4) Send(tcp TCP, additionalLayers ...Layer) {
 	conn.SendFrame(conn.CreateFrame(tcp, additionalLayers...))
 }
 
-// Recv gets a packet from the sniffer within the timeout provided. If no packet
-// arrives before the timeout, it returns nil.
+// Recv gets a packet from the sniffer within the timeout provided.
+// If no packet arrives before the timeout, it returns nil.
 func (conn *TCPIPv4) Recv(timeout time.Duration) *TCP {
+	layers := conn.RecvFrame(timeout)
+	if layers != nil && tcpLayerIndex < len(layers) {
+		return (layers[tcpLayerIndex]).(*TCP)
+	}
+	return nil
+}
+
+// RecvFrame gets a frame (of type Layers) within the timeout provided.
+// If no frame arrives before the timeout, it returns nil.
+func (conn *TCPIPv4) RecvFrame(timeout time.Duration) Layers {
 	deadline := time.Now().Add(timeout)
 	for {
 		timeout = time.Until(deadline)
@@ -216,14 +226,16 @@ func (conn *TCPIPv4) Recv(timeout time.Duration) *TCP {
 		for i := tcpLayerIndex + 1; i < len(layers); i++ {
 			conn.RemoteSeqNum.UpdateForward(seqnum.Size(layers[i].length()))
 		}
-		return tcpHeader
+		return layers
 	}
 	return nil
 }
 
 // Expect a packet that matches the provided tcp within the timeout specified.
-// If it doesn't arrive in time, the test fails.
+// If it doesn't arrive in time, it returns nil.
 func (conn *TCPIPv4) Expect(tcp TCP, timeout time.Duration) *TCP {
+	// We cannot implement this directly using ExpectFrame as we cannot specify
+	// the Payload part.
 	deadline := time.Now().Add(timeout)
 	for {
 		timeout = time.Until(deadline)
@@ -237,6 +249,38 @@ func (conn *TCPIPv4) Expect(tcp TCP, timeout time.Duration) *TCP {
 		if tcp.match(gotTCP) {
 			return gotTCP
 		}
+	}
+}
+
+// ExpectFrame expects a frame that matches the specified layers within the
+// timeout specified. If it doesn't arrive in time, it returns nil.
+func (conn *TCPIPv4) ExpectFrame(layers Layers, timeout time.Duration) Layers {
+	deadline := time.Now().Add(timeout)
+	for {
+		timeout = time.Until(deadline)
+		if timeout <= 0 {
+			return nil
+		}
+		gotLayers := conn.RecvFrame(timeout)
+		if gotLayers == nil {
+			return nil
+		}
+		if layers.match(gotLayers) {
+			return gotLayers
+		}
+	}
+}
+
+// ExpectData is a convenient method that expects a TCP packet along with
+// the payload to arrive within the timeout specified. If it doesn't arrive
+// in time, it causes a fatal test failure.
+func (conn *TCPIPv4) ExpectData(tcp TCP, data []byte, timeout time.Duration) {
+	expected := []Layer{&Ether{}, &IPv4{}, &tcp}
+	if data != nil {
+		expected = append(expected, &Payload{Bytes: data})
+	}
+	if conn.ExpectFrame(expected, timeout) == nil {
+		conn.t.Fatalf("Expect to get a TCP frame %v with payload %v", tcp, data)
 	}
 }
 

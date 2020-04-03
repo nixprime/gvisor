@@ -117,6 +117,18 @@ message SetSockOptTimevalResponse {
   int32 errno_ = 2;  // "errno" may fail to compile in c++.
 }
 
+message SetSockOptIntRequest {
+  int32 sockfd = 1;
+  int32 level = 2;
+  int32 optname = 3;
+  int32 intval = 4;
+}
+
+message SetSockOptIntResponse {
+  int32 ret = 1;
+  int32 errno_ = 2;
+}
+
 message CloseRequest {
   int32 fd = 1;
 }
@@ -138,6 +150,17 @@ message RecvResponse {
   bytes buf = 3;
 }
 
+message SendRequest {
+  int32 sockfd = 1;
+  bytes buf = 2;
+  int32 flags = 3;
+}
+
+message SendResponse {
+  int32 ret = 1;
+  int32 errno_ = 2;
+}
+
 service Posix {
   // Call socket() on the DUT.
   rpc Socket(SocketRequest) returns (SocketResponse);
@@ -157,8 +180,12 @@ service Posix {
   // Call setsockopt() on the DUT with a Timeval optval.
   rpc SetSockOptTimeval(SetSockOptTimevalRequest)
       returns (SetSockOptTimevalResponse);
+  // Call setsockopt() on the DUT with an int optval.
+  rpc SetSockOptInt(SetSockOptIntRequest) returns (SetSockOptIntResponse);
   // Call close() on the DUT.
   rpc Close(CloseRequest) returns (CloseResponse);
   // Call recv() on the DUT.
   rpc Recv(RecvRequest) returns (RecvResponse);
+  // Call send() on the DUT.
+  rpc Send(SendRequest) returns (SendResponse);
 }

@@ -317,6 +317,35 @@ func (dut *DUT) SetSockOptTimeval(sockfd, level, optname int32, tv *unix.Timeval
 	}
 }
 
+// SetSockOptIntWithErrno calls setsockopt with an integer optval
+func (dut *DUT) SetSockOptIntWithErrno(ctx context.Context, sockfd, level, optname, optval int32) (int32, error) {
+	dut.t.Helper()
+	req := pb.SetSockOptIntRequest{
+		Sockfd:  sockfd,
+		Level:   level,
+		Optname: optname,
+		Intval:  optval,
+	}
+	resp, err := dut.posixServer.SetSockOptInt(ctx, &req)
+	if err != nil {
+		dut.t.Fatalf("failed to call SetSockOptInt: %s", err)
+	}
+	return resp.GetRet(), syscall.Errno(resp.GetErrno_())
+}
+
+// SetSockOptInt calls setsockopt on the DUT and causes a fatal test failure
+// if it doesn't succeed. If more control over the int optval or error handling
+// is needed, use SetSockOptIntWithErrno.
+func (dut *DUT) SetSockOptInt(sockfd, level, optname, optval int32) {
+	dut.t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), *rpcTimeout)
+	defer cancel()
+	ret, err := dut.SetSockOptIntWithErrno(ctx, sockfd, level, optname, optval)
+	if ret != 0 {
+		dut.t.Fatalf("failed to SetSockOptInt: %s", err)
+	}
+}
+
 // RecvWithErrno calls recv on the DUT.
 func (dut *DUT) RecvWithErrno(ctx context.Context, sockfd, len, flags int32) (int32, []byte, error) {
 	dut.t.Helper()
@@ -344,6 +373,35 @@ func (dut *DUT) Recv(sockfd, len, flags int32) []byte {
 		dut.t.Fatalf("failed to recv: %s", err)
 	}
 	return buf
+}
+
+// SendWithErrno calls send on the DUT.
+func (dut *DUT) SendWithErrno(ctx context.Context, sockfd int32, buf []byte, flags int32) (int32, error) {
+	dut.t.Helper()
+	req := pb.SendRequest{
+		Sockfd: sockfd,
+		Buf:    buf,
+		Flags:  flags,
+	}
+	resp, err := dut.posixServer.Send(ctx, &req)
+	if err != nil {
+		dut.t.Fatalf("failed to call Send: %s", err)
+	}
+	return resp.GetRet(), syscall.Errno(resp.GetErrno_())
+}
+
+// Send calls send on the DUT and causes a fatal test failure if it doesn't
+// succeed. If more control over the timeout or error handling is needed, use
+// SendWithErrno.
+func (dut *DUT) Send(sockfd int32, buf []byte, flags int32) int32 {
+	dut.t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), *rpcTimeout)
+	defer cancel()
+	ret, err := dut.SendWithErrno(ctx, sockfd, buf, flags)
+	if ret == -1 {
+		dut.t.Fatalf("failed to send: %s", err)
+	}
+	return ret
 }
 
 // CloseWithErrno calls close on the DUT.
