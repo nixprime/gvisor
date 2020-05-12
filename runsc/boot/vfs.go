@@ -204,27 +204,56 @@ func (c *containerMounter) createMountNamespaceVFS2(ctx context.Context, conf *C
 }
 
 func (c *containerMounter) mountSubmountsVFS2(ctx context.Context, conf *Config, mns *vfs.MountNamespace, creds *auth.Credentials) error {
-	c.prepareMountsVFS2()
+	mounts, err := c.prepareMountsVFS2()
+	if err != nil {
+		return err
+	}
 
-	for _, submount := range c.mounts {
+	for i := range mounts {
+		submount := &mounts[i]
 		log.Debugf("Mounting %q to %q, type: %s, options: %s", submount.Source, submount.Destination, submount.Type, submount.Options)
-		if err := c.mountSubmountVFS2(ctx, conf, mns, creds, &submount); err != nil {
+		if err := c.mountSubmountVFS2(ctx, conf, mns, creds, submount); err != nil {
 			return err
 		}
 	}
 
 	// TODO(gvisor.dev/issue/1487): implement mountTmp from fs.go.
 
-	return c.checkDispenser()
+	return nil
 }
 
-func (c *containerMounter) prepareMountsVFS2() {
+type mountAndFD struct {
+	specs.Mount
+	fd int
+}
+
+func (c *containerMounter) prepareMountsVFS2() ([]mountAndFD, error) {
+	// Associate bind mounts with their FDs before sorting since there is an
+	// undocumented assumption that FDs are dispensed in the order in which
+	// they are required by mounts.
+	var mounts []mountAndFD
+	for _, m := range c.mounts {
+		fd := -1
+		if m.Type == bind {
+			fd = c.fds.remove()
+		}
+		mounts = append(mounts, mountAndFD{
+			Mount: m,
+			fd:    fd,
+		})
+	}
+	if err := c.checkDispenser(); err != nil {
+		return nil, err
+	}
+
 	// Sort the mounts so that we don't place children before parents.
-	sort.Slice(c.mounts, func(i, j int) bool { return len(c.mounts[i].Destination) < len(c.mounts[j].Destination) })
+	sort.Slice(mounts, func(i, j int) bool { return len(mounts[i].Destination) < len(mounts[j].Destination) })
+
+	return mounts, nil
 }
 
 // TODO(gvisor.dev/issue/1487): Implement submount options similar to the VFS1 version.
-func (c *containerMounter) mountSubmountVFS2(ctx context.Context, conf *Config, mns *vfs.MountNamespace, creds *auth.Credentials, submount *specs.Mount) error {
+func (c *containerMounter) mountSubmountVFS2(ctx context.Context, conf *Config, mns *vfs.MountNamespace, creds *auth.Credentials, submount *mountAndFD) error {
 	root := mns.Root()
 	defer root.DecRef()
 	target := &vfs.PathOperation{
@@ -233,7 +262,7 @@ func (c *containerMounter) mountSubmountVFS2(ctx context.Context, conf *Config, 
 		Path:  fspath.Parse(submount.Destination),
 	}
 
-	fsName, options, useOverlay, err := c.getMountNameAndOptionsVFS2(conf, *submount)
+	fsName, options, useOverlay, err := c.getMountNameAndOptionsVFS2(conf, submount)
 	if err != nil {
 		return fmt.Errorf("mountOptions failed: %w", err)
 	}
@@ -266,7 +295,7 @@ func (c *containerMounter) mountSubmountVFS2(ctx context.Context, conf *Config, 
 
 // getMountNameAndOptionsVFS2 retrieves the fsName, opts, and useOverlay values
 // used for mounts.
-func (c *containerMounter) getMountNameAndOptionsVFS2(conf *Config, m specs.Mount) (string, []string, bool, error) {
+func (c *containerMounter) getMountNameAndOptionsVFS2(conf *Config, m *mountAndFD) (string, []string, bool, error) {
 	var (
 		fsName     string
 		opts       []string
@@ -288,9 +317,8 @@ func (c *containerMounter) getMountNameAndOptionsVFS2(conf *Config, m specs.Moun
 		}
 
 	case bind:
-		fd := c.fds.remove()
 		fsName = "9p"
-		opts = p9MountOptionsVFS2(fd, c.getMountAccessType(m))
+		opts = p9MountOptionsVFS2(m.fd, c.getMountAccessType(m.Mount))
 		// If configured, add overlay to all writable mounts.
 		useOverlay = conf.Overlay && !mountFlags(m.Options).ReadOnly
 
