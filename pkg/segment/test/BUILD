@@ -47,6 +47,41 @@ go_template_instance(
     },
 )
 
+go_template_instance(
+    name = "invalidation_set",
+    out = "invalidation_set.go",
+    consts = {
+        "trackIteratorInvalidation": "1",
+    },
+    package = "segment",
+    prefix = "invalidation",
+    template = "//pkg/segment:generic_set",
+    types = {
+        "Key": "int",
+        "Range": "Range",
+        "Value": "int",
+        "Functions": "setFunctions",
+    },
+)
+
+go_template_instance(
+    name = "invalidation_gap_set",
+    out = "invalidation_gap_set.go",
+    consts = {
+        "trackGaps": "1",
+        "trackIteratorInvalidation": "1",
+    },
+    package = "segment",
+    prefix = "invalidationWithGaps",
+    template = "//pkg/segment:generic_set",
+    types = {
+        "Key": "int",
+        "Range": "Range",
+        "Value": "int",
+        "Functions": "gapSetFunctions",
+    },
+)
+
 go_library(
     name = "segment",
     testonly = 1,
@@ -54,6 +89,8 @@ go_library(
         "gap_set.go",
         "int_range.go",
         "int_set.go",
+        "invalidation_gap_set.go",
+        "invalidation_set.go",
         "set_functions.go",
     ],
     deps = [

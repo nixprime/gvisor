@@ -24,6 +24,8 @@ go_template(
         "minDegree",
         # trackGaps must either be 0 or 1.
         "trackGaps",
+        # trackIteratorInvalidation must either be 0 or 1.
+        "trackIteratorInvalidation",
     ],
     types = [
         "Key",
