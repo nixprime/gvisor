@@ -426,7 +426,7 @@ func (cm *containerManager) Restore(o *sentryapi.RestoreOpts, reply *sentryapi.R
 	}
 
 	// Create the main MemoryFile.
-	cm.restorer.mainMF, err = createMemoryFile(cm.l.root.conf.AppHugePages, cm.l.hostTHP, memoryAccountingMode(cm.l.root.conf.AppMemoryAccounting))
+	cm.restorer.mainMF, err = createMemoryFile(cm.l.root.conf, cm.l.hostTHP)
 	if err != nil {
 		return fmt.Errorf("creating memory file: %v", err)
 	}

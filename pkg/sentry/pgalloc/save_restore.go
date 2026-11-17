@@ -195,7 +195,9 @@ func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) er
 	// Wait for memory release.
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	for f.haveWaste {
+	for f.wastePages != 0 {
+		f.releaserUnthrottleLocked()
+		f.releaserNotify()
 		f.mu.Unlock()
 		runtime.Gosched()
 		f.mu.Lock()

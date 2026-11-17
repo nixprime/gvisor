@@ -91,6 +91,9 @@ func TestFromFlags(t *testing.T) {
 	if err := testFlags.Lookup("gofer-network-namespace").Value.Set("host"); err != nil {
 		t.Errorf("Flag set: %v", err)
 	}
+	if err := testFlags.Lookup("app-mem-release-window-ticks").Value.Set("8"); err != nil {
+		t.Errorf("Flag set: %v", err)
+	}
 
 	c, err := NewFromFlags(testFlags)
 	if err != nil {
@@ -110,6 +113,9 @@ func TestFromFlags(t *testing.T) {
 	}
 	if want := GoferNetworkNamespaceHost; c.GoferNetworkNamespace != want {
 		t.Errorf("GoferNetworkNamespace=%v, want: %v", c.GoferNetworkNamespace, want)
+	}
+	if want := 8; c.AppMemReleaseWindowTicks != want {
+		t.Errorf("AppMemReleaseWindowTicks=%d, want: %d", c.AppMemReleaseWindowTicks, want)
 	}
 
 	if err := testFlags.Lookup("network").Value.Set("sandbox"); err != nil {
@@ -372,6 +378,27 @@ func TestValidationFail(t *testing.T) {
 				"num-network-channels": "-1",
 			},
 			error: "num_network_channels must be > 0",
+		},
+		{
+			name: "app-mem-release-window-invalid",
+			flags: map[string]string{
+				"app-mem-release-window": "invalid",
+			},
+			error: "invalid app-mem-release-window",
+		},
+		{
+			name: "app-mem-release-window-negative",
+			flags: map[string]string{
+				"app-mem-release-window": "-1s",
+			},
+			error: "app-mem-release-window must be >= 0",
+		},
+		{
+			name: "app-mem-release-window-ticks",
+			flags: map[string]string{
+				"app-mem-release-window-ticks": "-1",
+			},
+			error: "app-mem-release-window-ticks must be >= 0",
 		},
 		{
 			name: "qdisc-tbf-burst-overflow",

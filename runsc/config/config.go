@@ -407,6 +407,19 @@ type Config struct {
 	// AppMemoryAccounting controls application memory accounting behavior.
 	AppMemoryAccounting AppMemoryAccounting `flag:"app-memory-accounting"`
 
+	// AppMemReleaseWindow sets pgalloc.MemoryFileOpts.ReleaseWindow for the
+	// app memory MemoryFile.
+	AppMemReleaseWindow string `flag:"app-mem-release-window"`
+
+	// AppMemReleaseWindowMaxBytes sets
+	// pgalloc.MemoryFileOpts.ReleaseWindowMaxBytes for the app memory
+	// MemoryFile.
+	AppMemReleaseWindowMaxBytes uint64 `flag:"app-mem-release-window-max-bytes"`
+
+	// AppMemReleaseWindowTicks sets pgalloc.MemoryFileOpts.ReleaseWindowTicks
+	// for the app memory MemoryFile.
+	AppMemReleaseWindowTicks int `flag:"app-mem-release-window-ticks"`
+
 	// NVProxy enables support for Nvidia GPUs.
 	NVProxy bool `flag:"nvproxy"`
 
@@ -618,6 +631,18 @@ func (c *Config) Validate() error {
 	}
 	if c.NumNetworkChannels <= 0 {
 		return fmt.Errorf("num_network_channels must be > 0, got: %d", c.NumNetworkChannels)
+	}
+	if c.AppMemReleaseWindow != "" {
+		releaseWindow, err := time.ParseDuration(c.AppMemReleaseWindow)
+		if err != nil {
+			return fmt.Errorf("invalid app-mem-release-window %q: %w", c.AppMemReleaseWindow, err)
+		}
+		if releaseWindow < 0 {
+			return fmt.Errorf("app-mem-release-window must be >= 0, got: %s", c.AppMemReleaseWindow)
+		}
+	}
+	if c.AppMemReleaseWindowTicks < 0 {
+		return fmt.Errorf("app-mem-release-window-ticks must be >= 0, got: %d", c.AppMemReleaseWindowTicks)
 	}
 	if c.PauseExternalNetworking && c.Network != NetworkSandbox {
 		return fmt.Errorf("pause-external-networking flag is only supported with sandbox networking")

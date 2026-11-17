@@ -857,7 +857,7 @@ func New(args Args) (*Loader, error) {
 	}
 
 	// Create memory file.
-	mf, err := createMemoryFile(args.Conf.AppHugePages, args.HostTHP, memoryAccountingMode(args.Conf.AppMemoryAccounting))
+	mf, err := createMemoryFile(args.Conf, args.HostTHP)
 	if err != nil {
 		return nil, fmt.Errorf("creating memory file: %w", err)
 	}
@@ -1304,7 +1304,7 @@ func memoryManagerOpts(conf *config.Config) mm.MemoryManagerOpts {
 	return opts
 }
 
-func createMemoryFile(appHugePages bool, hostTHP HostTHP, memAcctMode pgalloc.MemoryAccountingMode) (*pgalloc.MemoryFile, error) {
+func createMemoryFile(conf *config.Config, hostTHP HostTHP) (*pgalloc.MemoryFile, error) {
 	const memfileName = "runsc-memory"
 	memfd, err := memutil.CreateMemFD(memfileName, 0)
 	if err != nil {
@@ -1313,12 +1313,12 @@ func createMemoryFile(appHugePages bool, hostTHP HostTHP, memAcctMode pgalloc.Me
 	memfile := os.NewFile(uintptr(memfd), memfileName)
 
 	mfopts := pgalloc.MemoryFileOpts{
-		MemoryAccounting: memAcctMode,
+		MemoryAccounting: memoryAccountingMode(conf.AppMemoryAccounting),
 		// We can't enable pgalloc.MemoryFileOpts.UseHostMemcgPressure even if
 		// there are memory cgroups specified, because at this point we're already
 		// in a mount namespace in which the relevant cgroupfs is not visible.
 	}
-	if appHugePages {
+	if conf.AppHugePages {
 		switch hostTHP.ShmemEnabled {
 		case "":
 			log.Infof("Disabling application huge pages: host shmem_enabled is unknown")
@@ -1360,6 +1360,16 @@ func createMemoryFile(appHugePages bool, hostTHP HostTHP, memAcctMode pgalloc.Me
 			log.Warningf("Disabling application huge pages: host shmem_enabled is unknown value %q", hostTHP.ShmemEnabled)
 		}
 	}
+	if conf.AppMemReleaseWindow != "" {
+		releaseWindow, err := gtime.ParseDuration(conf.AppMemReleaseWindow)
+		if err != nil {
+			_ = memfile.Close()
+			return nil, fmt.Errorf("invalid AppMemReleaseWindow: %v", err)
+		}
+		mfopts.ReleaseWindow = releaseWindow
+	}
+	mfopts.ReleaseWindowMaxBytes = conf.AppMemReleaseWindowMaxBytes
+	mfopts.ReleaseWindowTicks = conf.AppMemReleaseWindowTicks
 
 	mf, err := pgalloc.NewMemoryFile(memfile, mfopts)
 	if err != nil {

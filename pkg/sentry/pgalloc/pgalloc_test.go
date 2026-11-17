@@ -75,6 +75,7 @@ func newFindAllocatableTestMemoryFile(t *testing.T, mode MemoryAccountingMode, c
 			case existingWaste:
 				unfree.InsertRange(chunkFR, unfreeInfo{refs: 0})
 				unwaste.RemoveRange(chunkFR)
+				f.wastePages += chunkFR.Length() >> hostarch.PageShift
 			case existingReleasing:
 				unfree.InsertRange(chunkFR, unfreeInfo{refs: 0})
 			default:

@@ -23,6 +23,7 @@ import (
 	"runtime"
 	"slices"
 	"testing"
+	"time"
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
@@ -155,24 +156,56 @@ func TestUnaccountedUsage(t *testing.T) {
 	}
 	t.Cleanup(f.Destroy)
 
-	// Wait for the releaser goroutine to release a waste page and go to sleep
-	// (it holds f.mu from clearing f.haveWaste until it waits), then set
-	// f.haveWaste so that DecRef doesn't wake it to release later waste pages.
-	fr, err := f.Allocate(uint64(hostarch.PageSize), AllocOpts{Mode: AllocateUncommitted})
-	if err != nil {
-		t.Fatalf("Allocate: %v", err)
-	}
-	f.DecRef(fr)
+	// Wait for the releaser goroutine to park in releaserWait(nil) with an
+	// empty releaserC, then set f.maxWastePages = 1 so that DecRef doesn't
+	// wake it to release later waste pages.
+	deadline := time.Now().Add(5 * time.Second)
 	f.mu.Lock()
-	for f.haveWaste {
+	for {
+		select {
+		case <-f.releaserC:
+		default:
+		}
+		f.releaserC <- struct{}{}
+		consumed := false
+		for range 64 {
+			if len(f.releaserC) == 0 {
+				consumed = true
+				break
+			}
+			runtime.Gosched()
+		}
+		if consumed {
+			break
+		}
+		select {
+		case <-f.releaserC:
+		default:
+		}
 		f.mu.Unlock()
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for releaser to block at releaserWait(nil)")
+		}
 		runtime.Gosched()
 		f.mu.Lock()
 	}
-	f.haveWaste = true
+	f.maxWastePages = 1
+	f.mu.Unlock()
+	for {
+		runtime.Gosched()
+		f.mu.Lock()
+		if f.maxWastePages == 0 {
+			break
+		}
+		f.mu.Unlock()
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for releaser to reset maxWastePages")
+		}
+	}
+	f.maxWastePages = 1
 	f.mu.Unlock()
 
-	fr = allocateSaveTestPages(t, f)
+	fr := allocateSaveTestPages(t, f)
 	pwritePage(t, f, fr, 2, 1)
 	pwritePage(t, f, fr, 3, 1)
 	waste, err := f.Allocate(uint64(hostarch.PageSize), AllocOpts{Mode: AllocateUncommitted})

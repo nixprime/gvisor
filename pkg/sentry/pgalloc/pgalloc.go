@@ -36,6 +36,7 @@ import (
 	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
+	"gvisor.dev/gvisor/pkg/gohacks"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/safemem"
@@ -116,15 +117,21 @@ type MemoryFile struct {
 	unwasteSmall unwasteSet
 	unwasteHuge  unwasteSet
 
-	// haveWaste is true if there may be at least one waste page in the
-	// MemoryFile.
-	//
-	// haveWaste is protected by mu.
-	haveWaste bool
+	// wastePages is the number of pages in the file that are waste, i.e. the
+	// span of all gaps in unwasteSmall + unwasteHuge divided by
+	// hostarch.PageSize. wastePages is protected by mu.
+	wastePages uint64
 
-	// releaseCond is signaled (with mu locked) when haveWaste or destroyed
-	// transitions from false to true.
-	releaseCond sync.Cond
+	// maxWastePages is the highest historical value of wastePages since the
+	// last time wastePages was 0. maxWastePages is protected by mu.
+	maxWastePages uint64
+
+	// releaseWindowMaxPages is opts.ReleaseWindowMaxBytes, but in units of
+	// pages. releaseWindowMaxPages is immutable.
+	releaseWindowMaxPages uint64
+
+	// releaserC is used to wake the releaser goroutine.
+	releaserC chan struct{} `state:"nosave"`
 
 	// unfreeSmall and unfreeHuge track information for non-free ranges backed
 	// by small/huge pages respectively. Each unfreeSet also contains segments
@@ -403,6 +410,28 @@ type MemoryFileOpts struct {
 	// MemoryAccounting specifies how memory usage for pages allocated from
 	// the MemoryFile is accounted in usage.MemoryAccounting.
 	MemoryAccounting MemoryAccountingMode
+
+	// If ReleaseWindow is positive, MemoryFile will attempt to release
+	// deallocated memory to the host OS within ReleaseWindow of deallocation.
+	// (For example, if ReleaseWindow is 1 second, and 100 MB of memory is
+	// deallocated, MemoryFile will target a memory release rate of 100 MB/s.)
+	// If ReleaseWindow is zero, MemoryFile will release deallocated memory to
+	// the host as quickly as possible.
+	ReleaseWindow time.Duration
+
+	// If ReleaseWindowMaxBytes is non-zero and ReleaseWindow is positive,
+	// ReleaseWindow is temporarily ignored (memory releasing is unthrottled)
+	// while the amount of deallocated but unreleased memory exceeds
+	// ReleaseWindowMaxBytes.
+	ReleaseWindowMaxBytes uint64
+
+	// If ReleaseWindow is positive, ReleaseWindowTicks bounds the memory
+	// released in each throttled release iteration to at most ReleaseWindow /
+	// ReleaseWindowTicks of post-release throttling delay (rounded up to page
+	// or huge page granularity), making release throttling more granular at
+	// low release rates at the cost of more host syscalls. If
+	// ReleaseWindowTicks is zero, MemoryFile will choose a default value.
+	ReleaseWindowTicks int
 }
 
 // MemoryAccountingMode is the type of MemoryFileOpts.MemoryAccounting.
@@ -471,6 +500,15 @@ const (
 	DelayedEvictionManual
 )
 
+const (
+	defaultReleaseWindowTicks = 4
+	maxReleaseWindowNS        = 24 * 60 * 60 * 1e9 // 24h
+	maxReleasingPages         = 1 << 15
+	// throttleNS (in MemoryFile.releaserMain()) cannot overflow as long as
+	// this compiles.
+	maxThrottleNS = uint64(maxReleasingPages * maxReleaseWindowNS)
+)
+
 // NewMemoryFile creates a MemoryFile backed by the given file. If
 // NewMemoryFile succeeds, ownership of file is transferred to the returned
 // MemoryFile.
@@ -491,14 +529,25 @@ func NewMemoryFile(file *os.File, opts MemoryFileOpts) (*MemoryFile, error) {
 	default:
 		return nil, fmt.Errorf("invalid MemoryFileOpts.MemoryAccounting: %v", opts.MemoryAccounting)
 	}
+	opts.ReleaseWindow = min(opts.ReleaseWindow, time.Duration(maxReleaseWindowNS))
+	if opts.ReleaseWindow <= 0 || opts.ReleaseWindowMaxBytes == 0 {
+		opts.ReleaseWindowMaxBytes = math.MaxUint64
+	}
+	if opts.ReleaseWindowTicks < 0 {
+		return nil, fmt.Errorf("invalid MemoryFileOpts.ReleaseWindowTicks: %d", opts.ReleaseWindowTicks)
+	}
+	if opts.ReleaseWindowTicks == 0 {
+		opts.ReleaseWindowTicks = defaultReleaseWindowTicks
+	}
 
 	// Truncate the file to 0 bytes first to ensure that it's empty.
 	if err := file.Truncate(0); err != nil {
 		return nil, err
 	}
 	f := &MemoryFile{
-		opts: opts,
-		file: file,
+		releaseWindowMaxPages: opts.ReleaseWindowMaxBytes >> hostarch.PageShift,
+		opts:                  opts,
+		file:                  file,
 	}
 	f.initFields()
 
@@ -506,7 +555,9 @@ func NewMemoryFile(file *os.File, opts MemoryFileOpts) (*MemoryFile, error) {
 		stop, err := hostmm.NotifyCurrentMemcgPressureCallback(func() {
 			f.mu.Lock()
 			startedAny := f.startEvictionsLocked()
+			f.releaserUnthrottleLocked()
 			f.mu.Unlock()
+			f.releaserNotify()
 			if startedAny {
 				log.Debugf("pgalloc.MemoryFile performing evictions due to memcg pressure")
 			}
@@ -530,7 +581,7 @@ func (f *MemoryFile) initFields() {
 	fullFR := memmap.FileRange{0, math.MaxUint64}
 	f.unwasteSmall.InsertRange(fullFR, unwasteInfo{})
 	f.unwasteHuge.InsertRange(fullFR, unwasteInfo{})
-	f.releaseCond.L = &f.mu
+	f.releaserC = make(chan struct{}, 1)
 	f.unfreeSmall.InsertRange(fullFR, unfreeInfo{})
 	f.unfreeHuge.InsertRange(fullFR, unfreeInfo{})
 	f.subreleased = make(map[uint64]uint64)
@@ -546,9 +597,9 @@ func (f *MemoryFile) initFields() {
 // Postconditions: None of f's methods may be called after Destroy.
 func (f *MemoryFile) Destroy() {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.destroyed = true
-	f.releaseCond.Signal()
+	f.mu.Unlock()
+	f.releaserNotify()
 }
 
 // Preconditions: f.mu must be locked.
@@ -819,6 +870,7 @@ func (f *MemoryFile) findAllocatableAndMarkUsed(alloc *allocState) (fr memmap.Fi
 		if uwgap.Ok() {
 			alloc.recycled = true
 			unwaste.Insert(uwgap, fr, unwasteInfo{})
+			f.wastePages -= alloc.length >> hostarch.PageShift
 			// Update reference count for these pages from 0 to 1.
 			unfree.MutateFullRange(fr, func(ufseg unfreeIterator) bool {
 				uf := ufseg.ValuePtr()
@@ -1365,9 +1417,9 @@ func (f *MemoryFile) DecRef(fr memmap.FileRange) {
 	}
 
 	f.mu.Lock()
-	defer f.mu.Unlock()
+	// Unlock not deferred; see below.
 
-	haveWaste := false
+	incWasteBytes := uint64(0)
 	f.forEachChunk(fr, func(chunk *chunkInfo, chunkFR memmap.FileRange) bool {
 		unwaste := &f.unwasteSmall
 		unfree := &f.unfreeSmall
@@ -1385,7 +1437,7 @@ func (f *MemoryFile) DecRef(fr memmap.FileRange) {
 				// Mark these pages as waste.
 				wasteFR := ufseg.Range()
 				unwaste.RemoveFullRange(wasteFR)
-				haveWaste = true
+				incWasteBytes += wasteFR.Length()
 				// Reclassify waste memory as System until it's recycled or
 				// released.
 				f.memAcct.MutateFullRange(wasteFR, func(maseg memAcctIterator) bool {
@@ -1407,18 +1459,82 @@ func (f *MemoryFile) DecRef(fr memmap.FileRange) {
 		return true
 	})
 
-	// Wake the releaser if we marked any pages as waste. Leave this until just
-	// before unlocking f.mu.
-	if haveWaste && !f.haveWaste {
-		f.haveWaste = true
-		f.releaseCond.Signal()
+	notify := false
+	if incWasteBytes != 0 {
+		prevWastePages := f.wastePages
+		f.wastePages += incWasteBytes >> hostarch.PageShift
+		if f.maxWastePages < f.wastePages {
+			// If release throttling is enabled, any increase in
+			// f.maxWastePages implies an increase in the target release rate,
+			// and therefore a need to wake up the releaser if it may be
+			// throttled. Otherwise, the releaser can only sleep if there were
+			// no waste pages.
+			if (f.opts.ReleaseWindow > 0 && prevWastePages <= f.releaseWindowMaxPages) || f.maxWastePages == 0 {
+				notify = true
+			}
+			f.maxWastePages = f.wastePages
+		} else if prevWastePages <= f.releaseWindowMaxPages && f.wastePages > f.releaseWindowMaxPages {
+			// Release throttling becomes inhibited above
+			// releaseWindowMaxPages, so wake the releaser if it is sleeping.
+			notify = true
+		}
+	}
+	f.mu.Unlock()
+	if notify {
+		f.releaserNotify()
 	}
 }
 
+// Preconditions: f.mu must be locked.
+func (f *MemoryFile) releaserUnthrottleLocked() {
+	f.maxWastePages = ^uint64(0) // MaxUint64
+}
+
+func (f *MemoryFile) releaserNotify() {
+	select {
+	case f.releaserC <- struct{}{}:
+	default:
+	}
+}
+
+func (f *MemoryFile) releaserWait(timerC <-chan time.Time) {
+	select {
+	case <-f.releaserC:
+	case <-timerC:
+	}
+}
+
+// releaserNanotimeContext identifies releaserNanotime's call site.
+type releaserNanotimeContext uint8
+
+const (
+	releaserNanotimeBeforeSleep releaserNanotimeContext = iota
+	releaserNanotimeAfterSleep
+	releaserNanotimeBeforeRelease
+	releaserNanotimeAfterRelease
+)
+
+func defaultReleaserNanotime(releaserNanotimeContext) int64 {
+	return gohacks.Nanotime()
+}
+
+// releaserNanotime returns the current monotonic time in nanoseconds. It may
+// be overridden in tests.
+var releaserNanotime = defaultReleaserNanotime
+
 // releaserMain implements the releaser goroutine.
 func (f *MemoryFile) releaserMain() {
+	throttleNSPerPage := uint64(0)
+	throttlePages := uint64(0)
+	var throttleTimer *time.Timer
+	var throttleTimerC <-chan time.Time
+	if f.opts.ReleaseWindow > 0 {
+		throttleTimer = time.NewTimer(0)
+		defer throttleTimer.Stop()
+		throttleTimerC = throttleTimer.C
+	}
+
 	f.mu.Lock()
-MainLoop:
 	for {
 		for {
 			if f.destroyed {
@@ -1431,16 +1547,75 @@ MainLoop:
 				}
 				return
 			}
-			if f.haveWaste {
+
+			if f.wastePages == 0 {
+				// All previous deallocations have been completely released, so
+				// we can reset release throttling.
+				f.maxWastePages = 0
+				throttlePages = 0
+				if f.opts.DelayedEviction == DelayedEvictionEnabled && !f.opts.UseHostMemcgPressure {
+					// Evict any pending evictable allocations to get more
+					// waste pages before going to sleep.
+					f.startEvictionsLocked()
+				}
+				// Wait for deallocation to create waste pages.
+				f.mu.Unlock()
+				f.releaserWait(nil)
+				f.mu.Lock()
+				continue
+			}
+
+			// f.wastePages != 0, so we have work to do.
+			// Determine the (reciprocal of the) current target release rate.
+			// While waste pages are being released, the target release rate
+			// cannot decrease, since this could allow previously-deallocated
+			// memory to remain unreleased beyond ReleaseWindow. Thus, the
+			// target release rate is based on f.maxWastePages rather than
+			// f.wastePages.
+			if f.opts.ReleaseWindow <= 0 {
+				// throttleNSPerPage and throttlePages remain fixed at 0.
 				break
 			}
-			if f.opts.DelayedEviction == DelayedEvictionEnabled && !f.opts.UseHostMemcgPressure {
-				// No work to do. Evict any pending evictable allocations to
-				// get more waste pages before going to sleep.
-				f.startEvictionsLocked()
+			throttleNSPerPage = 0
+			if f.wastePages <= f.releaseWindowMaxPages {
+				throttleNSPerPage = uint64(f.opts.ReleaseWindow.Nanoseconds()) / f.maxWastePages
 			}
-			f.releaseCond.Wait() // releases f.mu while waiting
+			if throttleNSPerPage == 0 {
+				// All throttled pages are slept off instantly.
+				throttlePages = 0
+				break
+			}
+			if throttlePages == 0 {
+				break
+			}
+
+			// Apply release throttling: Sleep off throttled pages at the
+			// current rate, or until we are woken (most likely due to an
+			// increase in the release rate).
+			throttleNS := throttlePages * throttleNSPerPage
+			f.mu.Unlock()
+			sleepStartTime := releaserNanotime(releaserNanotimeBeforeSleep)
+			select {
+			case <-throttleTimerC:
+			default:
+			}
+			throttleTimer.Reset(time.Duration(throttleNS))
+			f.releaserWait(throttleTimerC)
+
+			// Account for however long we actually slept for. Force sleptPages
+			// to be at least 1 so that frequent releaser wakeups can't prolong
+			// throttling indefinitely.
+			sleptPages := max(1, uint64(releaserNanotime(releaserNanotimeAfterSleep)-sleepStartTime)/throttleNSPerPage)
+			if throttlePages > sleptPages {
+				throttlePages -= sleptPages
+			} else {
+				throttlePages = 0
+			}
+			f.mu.Lock()
 		}
+
+		// Release waste pages.
+		//
 		// Huge pages are relatively rare and expensive due to fragmentation
 		// and the cost of compaction. Fragmentation is expected to increase
 		// over time. Most allocations are done upwards, with the main
@@ -1448,21 +1623,58 @@ MainLoop:
 		// correlate with older allocations, which are more likely to actually
 		// be hugepage-backed. Thus, release from unwasteSmall before
 		// unwasteHuge, and higher offsets before lower ones.
+		var releaseStartTime int64
+		if throttleNSPerPage != 0 {
+			releaseStartTime = releaserNanotime(releaserNanotimeBeforeRelease)
+		}
 		for i, unwaste := range []*unwasteSet{&f.unwasteSmall, &f.unwasteHuge} {
+			huge := i == 1
 			if uwgap := unwaste.LastLargeEnoughGap(1); uwgap.Ok() {
 				fr := uwgap.Range()
 				// Linux serializes fallocate()s on shmem files, so limit the amount we
 				// release at once to avoid starving Decommit().
-				const maxReleasingBytes = 128 << 20 // 128 MB
-				if fr.Length() > maxReleasingBytes {
-					fr.Start = fr.End - maxReleasingBytes
+				maxPages := uint64(maxReleasingPages)
+				if f.wastePages > f.releaseWindowMaxPages {
+					// Further limit the amount we release to avoid dropping
+					// below f.opts.ReleaseWindowMaxBytes without throttling.
+					maxPages = min(maxPages, f.wastePages-f.releaseWindowMaxPages)
+				} else if throttleNSPerPage != 0 {
+					// Further limit the amount we release per iteration to
+					// make release throttling more granular at low release
+					// rates.
+					maxDelayNS := uint64(f.opts.ReleaseWindow.Nanoseconds()) / uint64(f.opts.ReleaseWindowTicks)
+					throttleMaxPages := max(1, (maxDelayNS+throttleNSPerPage-1)/throttleNSPerPage) // round up
+					maxPages = min(maxPages, throttleMaxPages)
+				}
+				maxBytes := maxPages << hostarch.PageShift
+				if huge {
+					maxBytes = hostarch.MustHugePageRoundUp(maxBytes)
+				}
+				if fr.Length() > maxBytes {
+					fr.Start = fr.End - maxBytes
+					if huge {
+						// Avoid splitting a huge page at fr.Start if possible.
+						if alignedStart := hostarch.MustHugePageRoundUp(fr.Start); alignedStart < fr.End {
+							fr.Start = alignedStart
+						}
+					}
 				}
 				unwaste.Insert(uwgap, fr, unwasteInfo{})
-				f.releaseLocked(fr, i == 1)
-				continue MainLoop
+				f.releaseLocked(fr, huge)
+				releasedPages := fr.Length() >> hostarch.PageShift
+				f.wastePages -= releasedPages
+				if throttleNSPerPage != 0 {
+					// Determine how long to throttle for, to pay off the pages
+					// we just released. Deduct time spent releasing from the
+					// amount of time that we must spend throttling.
+					overheadPages := uint64(releaserNanotime(releaserNanotimeAfterRelease)-releaseStartTime) / throttleNSPerPage
+					if releasedPages > overheadPages {
+						throttlePages = releasedPages - overheadPages
+					} // else throttlePages = 0, but this is already the case
+				}
+				break
 			}
 		}
-		f.haveWaste = false
 	}
 }
 
@@ -1561,6 +1773,7 @@ func (f *MemoryFile) releaseLocked(fr memmap.FileRange, huge bool) {
 			decommitFR.Start = firstHugeStart
 			freeFR.Start = firstHugeStart
 		} else {
+			f.subreleased[firstHugeStart] = newSubrel
 			decommitFR.Start = fr.Start
 			freeFR.Start = firstHugeEnd
 		}
@@ -1579,6 +1792,7 @@ func (f *MemoryFile) releaseLocked(fr memmap.FileRange, huge bool) {
 			decommitFR.End = lastHugeEnd
 			freeFR.End = lastHugeEnd
 		} else {
+			f.subreleased[lastHugeStart] = newSubrel
 			decommitFR.End = fr.End
 			freeFR.End = lastHugeStart
 		}
@@ -1661,7 +1875,7 @@ func (f *MemoryFile) MarkEvictable(user EvictableMemoryUser, er EvictableRange) 
 			if !f.opts.UseHostMemcgPressure {
 				// Ensure that the releaser goroutine is running, so that it
 				// can start eviction when necessary.
-				f.releaseCond.Signal()
+				f.releaserNotify()
 			}
 		}
 	}

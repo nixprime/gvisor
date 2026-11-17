@@ -146,6 +146,9 @@ func RegisterFlags(flagSet *flag.FlagSet) {
 	flagSet.Int("fault-alloc-align-shift", -1, "binary logarithm of allocation size for app page faults on private anonymous mappings")
 	flagSet.Int("fault-copy-align-shift", -1, "binary logarithm of allocation size for app page faults on copy-on-write mappings")
 	flagSet.Var(AppMemoryAccountingCommitted.Ptr(), "app-memory-accounting", "controls application memory accounting behavior. One of: 'committed' (account pages asynchronously after host kernel does), 'allocated' (account pages when allocated in-sandbox).")
+	flagSet.String("app-mem-release-window", "", "maximum delay for freed application memory to be released to the host; if 0, release freed memory ASAP")
+	flagSet.Uint64("app-mem-release-window-max-bytes", 0, "if non-zero, release freed memory ASAP when unreleased memory exceeds app-mem-release-window-max-bytes")
+	flagSet.Int("app-mem-release-window-ticks", 0, "target minimum memory releases per app-mem-release-window")
 
 	// Flags that control sandbox runtime behavior: FS related.
 	flagSet.Var(fileAccessTypePtr(FileAccessExclusive), "file-access", "specifies which filesystem validation to use for the root mount: exclusive (default), shared.")
